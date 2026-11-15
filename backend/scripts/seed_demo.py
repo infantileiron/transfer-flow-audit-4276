@@ -1,9 +1,10 @@
 import json
 from sqlalchemy import select,func
 from src.config.database import Base,engine,Session
-from src.models import User,NetworkDataset,TransferArc,OutageScenario,NetworkRun,ResilienceReview,Report
+from src.models import User,NetworkDataset,TransferArc,OutageScenario,NetworkRun,ResilienceReview,Report,FlowSheet,FlowShard
 from src.services.analysis import analyze
 from src.services.arcs import snapshot
+from src.services import flowverify
 from src.utils.security import hash_password
 from src.utils.time import now
 def seed():
@@ -25,5 +26,24 @@ def seed():
   if not db.get(NetworkRun,"demo-run"):db.add(NetworkRun(id="demo-run",scenario_id="demo-outage",status="completed",result=analyze(db.get(NetworkDataset,"demo-data"),db.get(OutageScenario,"demo-outage")),error="",created_at=now()));db.flush()
   if not db.get(ResilienceReview,"demo-review"):db.add(ResilienceReview(id="demo-review",run_id="demo-run",note="每条边独立保留ID，逐边容量界与节点守恒通过，最大流等于割容量。最短时长路径是独立指标，不解释为最大流分配。",decision="accepted",author="analyst@hengyuan.demo",created_at=now()));db.flush()
   if not db.get(Report,"demo-report"):db.add(Report(id="demo-report",run_id="demo-run",title="衡远模拟中转·停边韧性复核",published_by="admin@hengyuan.demo",created_at=now()))
-  db.commit();return {m.__tablename__:db.scalar(select(func.count()).select_from(m)) for m in (User,NetworkDataset,TransferArc,OutageScenario,NetworkRun,ResilienceReview,Report)}
+  if not db.get(FlowSheet,"demo-sheet"):
+   run=db.get(NetworkRun,"demo-run");scenario=db.get(OutageScenario,"demo-outage");dataset=db.get(NetworkDataset,"demo-data")
+   base={row["arc_id"]:row["flow"] for row in run.result["outage"]["max_flow"]["arc_flows"]}
+   capacity={a["arc_id"]:a["capacity"] for a in scenario.arc_snapshot}
+   # 外部调度夹带的独立循环 e16(A→B)→e22(B→A)，不增加送达量；受容量界约束。
+   cycle_amount=min(1,capacity.get("e16",0)-base.get("e16",0),capacity.get("e22",0)-base.get("e22",0))
+   amounts=dict(base)
+   if cycle_amount>0:
+    amounts["e16"]=amounts.get("e16",0)+cycle_amount;amounts["e22"]=amounts.get("e22",0)+cycle_amount
+   nonzero=sorted((aid,v) for aid,v in amounts.items() if v>0)
+   half=len(nonzero)//2;chunks=[nonzero[:half],nonzero[half:]]
+   sheet=FlowSheet(id="demo-sheet",name="外部配流·停e13含循环验算",run_id="demo-run",expected_shards=2,received_shards=0,status="open",result={},differences={},error="",created_at=now(),sealed_at="")
+   db.add(sheet);db.flush()
+   for index,chunk in enumerate(chunks):
+    entries=[{"arc_id":aid,"amount":int(v)} for aid,v in chunk]
+    db.add(FlowShard(id=f"demo-shard-{index+1}",sheet_id=sheet.id,shard_index=index,checksum=flowverify.shard_checksum(entries),entries=entries,created_at=now()))
+    sheet.received_shards+=1
+   db.flush();passed,_,result=flowverify.verify([n["node_id"] for n in dataset.nodes],scenario.arc_snapshot,scenario.source_node,scenario.sink_node,scenario.disabled_arc_ids,amounts)
+   sheet.status="passed" if passed else "failed";sheet.result=result if passed else {};sheet.differences={} if passed else result;sheet.sealed_at=now()
+  db.commit();return {m.__tablename__:db.scalar(select(func.count()).select_from(m)) for m in (User,NetworkDataset,TransferArc,OutageScenario,NetworkRun,ResilienceReview,Report,FlowSheet,FlowShard)}
 if __name__=="__main__":print(json.dumps(seed(),ensure_ascii=False))

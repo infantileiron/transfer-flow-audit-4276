@@ -28,13 +28,24 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 SEED_DEMO=true初次建表并幂等填充固定ID/自然键，不重复新增、不覆盖用户修改。种子10节点22弧，容量箱/小时、时长分钟，含平行和反向边；预置无停用、停e13、源站出弧全停三方案，以及真实完成的停e13结果与报告。节点坐标仅作布局，无真实地理含义。所有数据模拟。
 
-## 六实体与页面
+## 实体与页面
 
-NetworkDataset保存节点和来源；TransferArc单独持久化每条ID/端点/非负整数容量/非负时长，唯一键为(dataset_id,arc_id)，允许端点重复或反向；OutageScenario在建立时冻结全部边快照，记录源汇与停用ID；NetworkRun经Redis独立worker计算并保存证据；ResilienceReview保存人工判断；Report仅在最新意见accepted后由admin归档，run唯一。
+NetworkDataset保存节点和来源；TransferArc单独持久化每条ID/端点/非负整数容量/非负时长，唯一键为(dataset_id,arc_id)，允许端点重复或反向；OutageScenario在建立时冻结全部边快照，记录源汇与停用ID；NetworkRun经Redis独立worker计算并保存证据；ResilienceReview保存人工判断；Report仅在最新意见accepted后由admin归档，run唯一；FlowSheet绑定一次run保存验算单状态/差额/分解证据，FlowShard以(sheet_id,shard_index)唯一保存逐片运量与内容校验码。
 
-六业务页：韧性总览、网络与节点、容量与时长、停用方案、流量与绕行、韧性复核（含操作留痕）。平行/反向边曲线错开，逐边台账和残量表保留完整ID；近竖直平行/反向标签向两侧外置，避免中点重叠。图中最大流视图与独立最短路径视图分开，基线/停用两组数值明确；手机图在局部横向容器滚动，页面本身不横溢。
+前六业务页：韧性总览、网络与节点、容量与时长、停用方案、流量与绕行、韧性复核（含操作留痕）；第七业务页为配流验算（补传、封单、回看验算明细）。平行/反向边曲线错开，逐边台账和残量表保留完整ID；近竖直平行/反向标签向两侧外置，避免中点重叠。图中最大流视图与独立最短路径视图分开，基线/停用两组数值明确；手机图在局部横向容器滚动，页面本身不横溢。
 
 新增边不会改变旧推演；如需纳入比较，必须新建方案冻结新快照，保证前后比较来自同一份容量和时长。
+
+## 外部配流验算单（第七业务页）
+
+自产页面只给Edmonds–Karp最大流；外部调度系统推来的逐边运量可能夹带循环，需要单独验算。FlowSheet绑定一次已完成NetworkRun，复用其OutageScenario冻结的容量、时长、源汇与停用边状态；FlowShard按(sheet_id,shard_index)唯一保存分片，内容存规范化SHA256校验码。
+
+- 分片接收：逐边只收非负整数运量（布尔、浮点、负数、超界后端422），缺边按零。同号同文重试幂等返回、不重复写入；同号异文409拒绝覆盖；同一arc_id跨分片重复409；未知边ID422。中断后凭分片编号接着补传。
+- 封单并发：补传与封单都对验算单行加`SELECT … FOR UPDATE`串行化。封单成功后状态离开open，内容以封单成功时刻的完整分片为准；封单后任何补传或再次封单409拒绝改写。声明了预期分片数时，未收齐拒绝封单。
+- 核对：停用边有效容量按0，逐边核对0≤运量≤有效容量；按节点汇总流入/流出，源余额=送达量、汇=负送达量、其余为0。失败列出未知边、容量超限（含超出量）与节点差额，`status=failed`且不发布任何分解。
+- 分解：核对通过后先反复抽取源→汇正流路径，再用三色DFS剥离独立循环，逐边合计必须精确还原原运量；循环只在内部周转，不计入送达量。平行边（同端点多ID）与反向边（u→v与v→u并存）分别分组对账，不按端点合并。
+
+种子在停e13推演上预置一张分两片、夹带e16/e22独立循环的已通过验算单，送达量与自产最大流同为6、循环总量1，可直接回看明细。
 
 ## 两个算法与证据
 
@@ -65,7 +76,7 @@ NetworkDataset保存节点和来源；TransferArc单独持久化每条ID/端点/
 |持久化|MySQL8.4，整数容量、DOUBLE时长、JSON冻结快照/证据|
 |后台|Redis7.4 AOF、独立Python worker与心跳|
 
-frontend/src含api/stores/types/components/common/hooks/pages/router/utils/constants；backend/src含routes/controllers/services/models/schemas/middlewares/utils/constants/config；backend/scripts为seed，backend/migrations说明初次模型建表。测试、截图、日志、TESTING/verification均在批次test-artifacts/gb-2310，不混入源码。
+frontend/src含api/stores/types/components/common/hooks/pages/router/utils/constants；backend/src含routes/controllers/services/models/schemas/middlewares/utils/constants/config；backend/scripts为seed，backend/migrations说明初次模型建表。配流验算单为models/flowsheet+flowshard、schemas/flowsheet、services/flowverify（纯函数验算/分解）+flowsheets（行锁编排）、routes/flow_sheets，前端为pages/FlowSheets与components/SheetDetail。测试、截图、日志、TESTING/verification均在批次test-artifacts/gb-2310，不混入源码。
 
 本地后端安装requirements.txt，配置DATABASE_URL/REDIS_URL/JWT_SECRET，在backend执行`uvicorn src.main:app --reload`，另开`python -m src.worker`。前端`npm ci && npm run dev`，Vite已将/api代理到19229并去前缀，Docker Nginx同样处理。Vue已验证锁文件只JSON修改根名/根package名，依赖节点不变，Docker使用npm ci。
 

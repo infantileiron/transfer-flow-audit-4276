@@ -11,3 +11,7 @@ class RunStatus(str,Enum):
 class Decision(str,Enum):
  accepted="accepted"
  needs_attention="needs_attention"
+class SheetStatus(str,Enum):
+ open="open"
+ passed="passed"
+ failed="failed"
